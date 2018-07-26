@@ -1,53 +1,92 @@
 package com.silver.nettyrpc.server;
 
+import com.silver.nettyrpc.protocol.RpcRequest;
+import com.silver.nettyrpc.protocol.RpcResponse;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.*;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
+import net.sf.cglib.reflect.FastClass;
+import net.sf.cglib.reflect.FastMember;
+import net.sf.cglib.reflect.FastMethod;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.Map;
 
 import static io.netty.handler.codec.http.HttpResponseStatus.OK;
 import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 
-public class ServerHandler extends SimpleChannelInboundHandler {
-    private static final byte[] CONTENT = { 'H', 'e', 'l', 'l', 'o', ' ', 'W', 'o', 'r', 'l', 'd' };
+public class ServerHandler extends SimpleChannelInboundHandler<RpcRequest> {
+    private static final Logger logger = LoggerFactory.getLogger(ServerHandler.class);
 
-    private static final AsciiString CONTENT_TYPE = AsciiString.cached("Content-Type");
-    private static final AsciiString CONTENT_LENGTH = AsciiString.cached("Content-Length");
-    private static final AsciiString CONNECTION = AsciiString.cached("Connection");
-    private static final AsciiString KEEP_ALIVE = AsciiString.cached("keep-alive");
+    private final Map<String, Object> handlerMap;
 
-    @Override
-    public void channelReadComplete(ChannelHandlerContext ctx) {
-        ctx.flush();
+    public ServerHandler(Map<String, Object> handlerMap) {
+        this.handlerMap = handlerMap;
     }
 
-    @Override
-    public void channelRead0(ChannelHandlerContext ctx, Object msg) {
-        if (msg instanceof FullHttpRequest) {
-            FullHttpRequest req = (FullHttpRequest) msg;
-            System.out.println(req.content().toString(CharsetUtil.UTF_8));
-            boolean keepAlive = HttpUtil.isKeepAlive(req);
-            FullHttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, OK, Unpooled.wrappedBuffer(CONTENT));
-            response.headers().set(CONTENT_TYPE, "text/plain");
-            response.headers().setInt(CONTENT_LENGTH, response.content().readableBytes());
 
-            if (!keepAlive) {
-                ctx.write(response).addListener(ChannelFutureListener.CLOSE);
-            } else {
-                response.headers().set(CONNECTION, KEEP_ALIVE);
-                ctx.write(response);
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, RpcRequest request) throws Exception {
+        ServerRPC.submit(new Runnable() {
+            @Override
+            public void run() {
+                logger.debug("Receive request: " +request.getRequestId());
+                RpcResponse response = new RpcResponse();
+                response.setRequestId(request.getRequestId());
+                try{
+                    Object result = handle(request);
+                    response.setResult(result);
+                }catch (Throwable throwable){
+                    response.setError(throwable.toString());
+                    logger.debug("Server handle request error" + throwable);
+                }
+                ctx.writeAndFlush(response).addListener(new ChannelFutureListener() {
+                    @Override
+                    public void operationComplete(ChannelFuture future) throws Exception {
+                        logger.debug("Send response for request "+ request.getRequestId());
+                    }
+                });
             }
-        }
+        });
     }
 
+    /**
+     * 获取RPC请求中的Class、Mthod、paramtertype、parameter等属性
+     * 并调用Cglib进行反射调用方法，返回调用结果
+     * @param request
+     * @return
+     * @throws InvocationTargetException
+     */
+    public Object handle(RpcRequest request) throws InvocationTargetException {
+        String className = request.getClassName();
+        Object serviceBean = handlerMap.get(className);
+
+        Class<?> serviceClass = serviceBean.getClass();
+        String methodName = request.getMethodName();
+        Class<?>[] parameterType = request.getParameterTypes();
+        Object[] parameters = request.getParameters();
+
+        logger.debug(serviceClass.getName());
+        logger.debug(methodName);
+        for (Class<?> temp : parameterType) logger.debug(temp.getName());
+        for (Object temp: parameters) logger.debug(temp.toString());
+
+        FastClass serviceFastClass = FastClass.create(serviceClass);
+        FastMethod serviceFastMethod = serviceFastClass.getMethod(methodName,parameterType);
+
+        return serviceFastMethod.invoke(serviceBean,parameters);
+
+    }
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        cause.printStackTrace();
+        logger.error("server caught exception", cause);
         ctx.close();
     }
-
-
 }
